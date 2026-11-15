@@ -1,6 +1,7 @@
 // server.js — Proof Gatekeeper + Steal the VFY, SATU FILE,
-// untuk zkVerify Agent Games. v1.1.1 (deploy ulang: bump versi
-// supaya push baru ke GitHub memicu deployment baru di Railway).
+// untuk zkVerify Agent Games. v1.1.2 (idempotencyKey Steal harus
+// berupa UUID yang valid — diperbaiki dari format lama
+// "match-...-turn-...").
 // =====================================================================
 // Cara pakai dari HP (tanpa folder, tanpa zip):
 //   1. Di GitHub, buat repo baru, lalu Add file > Upload files,
@@ -508,9 +509,20 @@ async function handleSteal(req, res, envelope) {
     return sendJson(res, 200, seenStealResponses.get(key));
   }
 
+  // idempotencyKey HARUS berupa UUID yang valid (validator platform
+  // memakai z.string().uuid()). Dibuat deterministik dari
+  // keccak256(matchId + ':' + turn) supaya retry turn yang sama
+  // selalu memakai key yang sama, dan turn yang berbeda selalu
+  // memakai key yang berbeda. 16 byte pertama hash dipakai sebagai
+  // bahan UUID, dengan bit versi (4) dan varian (10) disetel.
+  const keyHash = keccak256(matchId + ':' + turnNumber);
+  const keyBytes = Buffer.from(keyHash.slice(0, 32), 'hex');
+  keyBytes[6] = (keyBytes[6] & 0x0f) | 0x40;
+  keyBytes[8] = (keyBytes[8] & 0x3f) | 0x80;
+  const keyHex = keyBytes.toString('hex');
   const idempotencyKey =
-    `match-${matchId.slice(0, 8)}-turn-${turnNumber}-` +
-    keccak256(matchId + ':' + turnNumber).slice(0, 8);
+    `${keyHex.slice(0, 8)}-${keyHex.slice(8, 12)}-${keyHex.slice(12, 16)}-` +
+    `${keyHex.slice(16, 20)}-${keyHex.slice(20, 32)}`;
 
   // Deadline hampir habis -> HOLD cepat tanpa proof.
   const late = deadline ? Date.parse(deadline) - Date.now() < 2000 : false;
