@@ -1,5 +1,6 @@
 // server.js — Proof Gatekeeper + Steal the VFY, SATU FILE,
-// untuk zkVerify Agent Games.
+// untuk zkVerify Agent Games. v1.1.1 (deploy ulang: bump versi
+// supaya push baru ke GitHub memicu deployment baru di Railway).
 // =====================================================================
 // Cara pakai dari HP (tanpa folder, tanpa zip):
 //   1. Di GitHub, buat repo baru, lalu Add file > Upload files,
