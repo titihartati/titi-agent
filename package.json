@@ -1,0 +1,1 @@
+{"dependencies":{"snarkjs":"0.7.6"},"description":"Proof Gatekeeper untuk zkVerify Agent Games Season 01 — satu file server.js, siap deploy ke Railway.","engines":{"node":">=20"},"main":"server.js","name":"agent-games-gatekeeper","scripts":{"start":"node server.js"},"version":"1.0.0"}
