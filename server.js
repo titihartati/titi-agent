@@ -1,4 +1,5 @@
-// server.js — Proof Gatekeeper, SATU FILE, untuk zkVerify Agent Games.
+// server.js — Proof Gatekeeper + Steal the VFY, SATU FILE,
+// untuk zkVerify Agent Games.
 // =====================================================================
 // Cara pakai dari HP (tanpa folder, tanpa zip):
 //   1. Di GitHub, buat repo baru, lalu Add file > Upload files,
@@ -18,23 +19,36 @@
 //      sebelum platform menandai agent kamu aktif.
 //   6. Jalankan preflight + 1 practice task dari dashboard.
 //
-// Yang dilakukan file ini (sudah dites, 20 PASS di versi modularnya):
-//   - Terima POST JSON task di / (juga /task, /agent)
-//   - Verifikasi HMAC x-agent-games-signature terhadap RAW body dulu
-//   - Cek 7 trap -> APPROVE hanya kalau semua lolos, kalau tidak REJECT
-//   - Generate Groth16 proof lokal dengan circuit resmi (snarkjs).
-//     Circuit (.wasm + .zkey) DIUNDUH OTOMATIS saat pertama jalan
-//     dari agentgames.zkverify.io, jadi kamu tidak perlu upload
-//     file circuit yang 2 MB itu dari HP.
-//   - Response ditandatangani HMAC, task_id dipakai idempotency key.
-//   - Kalau ragu / error / hampir timeout: FAIL CLOSED = REJECT.
+// Yang dilakukan file ini:
+//   GATEKEEPER — terima POST task di /agent, verifikasi HMAC,
+//   cek 7 trap -> APPROVE hanya kalau semua lolos, kalau tidak
+//   REJECT, generate Groth16 proof lokal dengan circuit resmi.
+//   STEAL THE VFY — terima POST turn envelope di /agent yang
+//   sama, kenali dari eventId "steal-the-vfy" (atau adanya
+//   matchId + turn + balances), mainkan strategi deterministik,
+//   hitung publicInputsHash (keccak256, urutan field persis
+//   seperti /build), generate policy proof lokal dengan circuit
+//   resmi vfy-policy, dan jawab dengan skema VFY:
+//   { matchId, turn, action, policyProof, agentTimestamp,
+//     idempotencyKey } + proof & public_signals.
+//   Circuit (.wasm + .zkey) DIUNDUH OTOMATIS saat pertama jalan
+//   dari agentgames.zkverify.io, jadi kamu tidak perlu upload
+//   file circuit dari HP.
+//   Response ditandatangani HMAC. Kalau ragu / error / hampir
+//   timeout: FAIL CLOSED (Gatekeeper = REJECT, Steal = HOLD
+//   tanpa proof — sama seperti yang dilakukan platform kalau
+//   agent diam).
 //
 // Env:
 //   AGENT_GAMES_HMAC_SECRET  WAJIB (dari dashboard Agent Games)
 //   PORT                     diisi Railway otomatis (lokal: 3000)
 //   ZKVERIFY_MODE            local (default) atau kurier (opsional)
-//   KURIER_API_URL, KURIER_API_KEY, KURIER_CHAIN_ID, KURIER_TIMEOUT_MS
+//   KURIER_API_URL, KURIER_API_KEY, KURIER_TIMEOUT_MS
 //                            hanya kalau ZKVERIFY_MODE=kurier
+//   STRATEGY_SALT            opsional, salt rahasia untuk policy
+//                            proof Steal (jangan di-commit; kalau
+//                            tidak diisi, dipakai salt acak per
+//                            match yang sama selama server hidup)
 
 'use strict';
 
@@ -43,6 +57,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const snarkjs = require('snarkjs');
+const { keccak256 } = require('js-sha3');
 
 // ------------------------------------------------------------------
 // Circuit resmi Gatekeeper (Groth16/BN128, Circom 2.x)
@@ -55,6 +70,21 @@ const ZKEY_URL = 'https://agentgames.zkverify.io/circuits/gatekeeper_final.zkey'
 const CIRCUIT_DIR = path.join(__dirname, 'circuits');
 const WASM_PATH = path.join(CIRCUIT_DIR, 'gatekeeper.wasm');
 const ZKEY_PATH = path.join(CIRCUIT_DIR, 'gatekeeper_final.zkey');
+
+// ------------------------------------------------------------------
+// Circuit resmi Steal the VFY (vfy-policy, Groth16/BN128, Circom 2.x)
+// vkHash mainnet dari https://agentgames.zkverify.io/api/circuit-info
+// Sinyal input (ditemukan dengan probing wasm, 17 total):
+//   publik: commitment, matchId, turnNumber, selfBalance,
+//   opponentBalance, action, amount, circuitVersion (+ 1 output)
+//   privat: strategyParams[8], salt
+// ------------------------------------------------------------------
+const VFY_VK_HASH =
+  '0x6c56509f1c56fd1fd4e9737f906d2220f4b95f1d507f1adf6899085bd74be047';
+const VFY_WASM_URL = 'https://agentgames.zkverify.io/circuits/vfy-policy.wasm';
+const VFY_ZKEY_URL = 'https://agentgames.zkverify.io/circuits/vfy-policy_final.zkey';
+const VFY_WASM_PATH = path.join(CIRCUIT_DIR, 'vfy-policy.wasm');
+const VFY_ZKEY_PATH = path.join(CIRCUIT_DIR, 'vfy-policy_final.zkey');
 
 const PORT = Number(process.env.PORT || 3000);
 const HMAC_SECRET =
@@ -74,7 +104,7 @@ async function ensureCircuits() {
   if (!circuitsReady) {
     circuitsReady = (async () => {
       fs.mkdirSync(CIRCUIT_DIR, { recursive: true });
-      for (const [url, dest] of [[WASM_URL, WASM_PATH], [ZKEY_URL, ZKEY_PATH]]) {
+      for (const [url, dest] of [[WASM_URL, WASM_PATH], [ZKEY_URL, ZKEY_PATH], [VFY_WASM_URL, VFY_WASM_PATH], [VFY_ZKEY_URL, VFY_ZKEY_PATH]]) {
         if (fs.existsSync(dest) && fs.statSync(dest).size > 100_000) {
           console.log('[circuit] sudah ada:', path.basename(dest));
           continue;
@@ -214,10 +244,144 @@ async function generateProof(decisionResult, taskId) {
 }
 
 // ------------------------------------------------------------------
-// Kurier (opsional, default mati). ZKVERIFY_MODE=kurier untuk nyalakan.
-// Submit dibatasi timeout supaya tidak bikin jawaban telat (60 detik).
+// STEAL THE VFY
+// Strategi (dipilih sekali, deterministik — state yang sama selalu
+// menghasilkan aksi yang sama, sesuai panduan /build):
+//   "Fortify when my balance is below the opponent's, otherwise
+//    extract 5 when the opponent's balance is high enough, else hold."
+//   - self < opponent            -> FORTIFY (biaya 2, blokir s.d. 6)
+//   - self >= opponent, opp >= 5 -> EXTRACT 5
+//   - selain itu                 -> HOLD
+// Aturan amount (dari /build, "Common mistakes"): HOLD dan FORTIFY
+// TIDAK BOLEH membawa field amount sama sekali — skema menolak
+// field itu walaupun nilainya 0. Hanya EXTRACT yang membawa amount.
 // ------------------------------------------------------------------
-async function submitToKurier(proof, publicSignals) {
+const VFY_ACTION_CODE = { HOLD: 0, FORTIFY: 1, EXTRACT: 2 };
+const VFY_STRATEGY_EXTRACT_AMOUNT = 5;
+const FIELD_P =
+  21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+
+function decideStealAction(selfBalance, opponentBalance) {
+  const self = BigInt(selfBalance);
+  const opp = BigInt(opponentBalance);
+  if (self < opp) return { type: 'FORTIFY' };
+  if (opp >= BigInt(VFY_STRATEGY_EXTRACT_AMOUNT)) {
+    return { type: 'EXTRACT', amount: VFY_STRATEGY_EXTRACT_AMOUNT };
+  }
+  return { type: 'HOLD' };
+}
+
+function matchIdToBigInt(matchId) {
+  const s = String(matchId || '').replace(/-/g, '');
+  if (!s) return 0n;
+  try {
+    return BigInt('0x' + s);
+  } catch {
+    return 0n;
+  }
+}
+function hexToBigInt(value) {
+  if (value === undefined || value === null || value === '') return 0n;
+  try {
+    return BigInt(String(value).trim());
+  } catch {
+    return 0n;
+  }
+}
+function to32BytesBE(value) {
+  const buf = Buffer.alloc(32);
+  let v = BigInt(value);
+  for (let i = 31; i >= 0; i--) {
+    buf[i] = Number(v & 0xffn);
+    v >>= 8n;
+  }
+  return buf;
+}
+// publicInputsHash — persis seperti kode di /build:
+// keccak256 dari 8 field, masing-masing dipadatkan ke 32 byte
+// big-endian, dengan urutan: commitment, matchId (tanpa "-"),
+// turn, selfBalance, opponentBalance, kode aksi (HOLD 0, FORTIFY 1,
+// EXTRACT 2), amount (0 untuk HOLD/FORTIFY), nomor versi circuit
+// ("v1" -> 1). Platform menghitung hash yang sama dari game state
+// yang diketahuinya dan menolak proof kalau hash-nya berbeda.
+function computePublicInputsHash(fields) {
+  const versionNum =
+    typeof fields.circuitVersion === 'string' && fields.circuitVersion.startsWith('v')
+      ? BigInt(fields.circuitVersion.slice(1))
+      : BigInt(fields.circuitVersion || 1);
+  const parts = [
+    to32BytesBE(hexToBigInt(fields.commitment)),
+    to32BytesBE(matchIdToBigInt(fields.matchId)),
+    to32BytesBE(BigInt(fields.turn)),
+    to32BytesBE(BigInt(fields.selfBalance)),
+    to32BytesBE(BigInt(fields.opponentBalance)),
+    to32BytesBE(BigInt(VFY_ACTION_CODE[fields.actionType])),
+    to32BytesBE(BigInt(fields.amount || 0)),
+    to32BytesBE(versionNum),
+  ];
+  return '0x' + keccak256(Buffer.concat(parts));
+}
+
+// strategyParams[8] — encoding strategi di atas untuk circuit
+// vfy-policy (sinyal privat; arti pastinya tidak dipublikasikan
+// situs, jadi encoding ini adalah milik agent sendiri):
+//   [0] jumlah EXTRACT strategi (5)
+//   [1] ambang selisih saldo untuk FORTIFY (0: fortify kalau
+//       self < opponent)
+//   [2..7] cadangan (0)
+function stealStrategyParams() {
+  return [
+    String(VFY_STRATEGY_EXTRACT_AMOUNT),
+    '0',
+    '0',
+    '0',
+    '0',
+    '0',
+    '0',
+    '0',
+  ];
+}
+// Salt per match, deterministik (match yang sama -> salt yang sama,
+// jadi jawaban retry identik). STRATEGY_SALT (env) bisa dipakai
+// sebagai garam rahasia tambahan; kalau tidak diisi, salt hanya
+// berasal dari matchId.
+function stealSalt(matchId) {
+  const base = process.env.STRATEGY_SALT
+    ? keccak256(String(process.env.STRATEGY_SALT) + ':' + String(matchId))
+    : keccak256('vfy-salt:' + String(matchId));
+  return (BigInt('0x' + base) % FIELD_P).toString(10);
+}
+
+async function generateVfyProof(fields) {
+  await ensureCircuits();
+  const input = {
+    commitment: (hexToBigInt(fields.commitment) % FIELD_P).toString(10),
+    matchId: (matchIdToBigInt(fields.matchId) % FIELD_P).toString(10),
+    turnNumber: String(fields.turn),
+    selfBalance: String(fields.selfBalance),
+    opponentBalance: String(fields.opponentBalance),
+    action: String(VFY_ACTION_CODE[fields.actionType]),
+    amount: String(fields.amount || 0),
+    circuitVersion: String(
+      typeof fields.circuitVersion === 'string' && fields.circuitVersion.startsWith('v')
+        ? fields.circuitVersion.slice(1)
+        : fields.circuitVersion || 1
+    ),
+    strategyParams: stealStrategyParams(),
+    salt: stealSalt(fields.matchId),
+  };
+  const { proof, publicSignals } = await snarkjs.groth16.fullProve(
+    input, VFY_WASM_PATH, VFY_ZKEY_PATH
+  );
+  return { proof, publicSignals: publicSignals.map(String) };
+}
+
+// ------------------------------------------------------------------
+// Kurier (opsional, default mati). ZKVERIFY_MODE=kurier untuk nyalakan.
+// Submit dibatasi timeout supaya tidak bikin jawaban telat.
+// vkHash default = Gatekeeper; untuk Steal kirim VFY_VK_HASH.
+// ------------------------------------------------------------------
+async function submitToKurier(proof, publicSignals, vkHash = VK_HASH) {
   if (process.env.ZKVERIFY_MODE !== 'kurier') return null;
   // URL resmi dari /build: https://api.kurier.xyz/api/v1
   const apiUrl = (process.env.KURIER_API_URL || 'https://api.kurier.xyz/api/v1').replace(/\/$/, '');
@@ -236,7 +400,7 @@ async function submitToKurier(proof, publicSignals) {
         proofType: 'groth16',
         vkRegistered: true, // vk Gatekeeper sudah terdaftar di mainnet
         proofOptions: { library: 'snarkjs', curve: 'bn128' },
-        proofData: { proof, publicSignals, vk: VK_HASH },
+        proofData: { proof, publicSignals, vk: vkHash },
       }),
     });
     clearTimeout(timer);
@@ -302,6 +466,121 @@ function readRawBody(req) {
   });
 }
 
+const seenStealResponses = new Map(); // `${matchId}:${turn}` -> response
+
+function toBalance(value, fallback) {
+  try {
+    if (value === undefined || value === null || value === '') return BigInt(fallback);
+    return BigInt(value);
+  } catch {
+    return BigInt(fallback);
+  }
+}
+
+// Handler Steal the VFY: jawab SATU turn dengan skema VFY.
+// Skema respons (dari /build): matchId, turn, action, policyProof,
+// agentTimestamp, idempotencyKey — plus proof & public_signals
+// (di level atas DAN di dalam policyProof, karena situs menaruhnya
+// di dua tempat yang berbeda; validator Zod default mengabaikan
+// field yang tidak dikenal, jadi duplikasi ini aman).
+// Kalau generate proof gagal (mis. circuit menolak input), tetap
+// kirim jawaban dengan skema yang benar + publicInputsHash yang
+// benar, tanpa proof — platform akan memberi diagnostic berikutnya
+// (HOLD/-2) dan bukan schema error.
+async function handleSteal(req, res, envelope) {
+  const startedAt = Date.now();
+  const turn = envelope.input || envelope.task || envelope;
+  const matchId = String(turn.matchId || turn.match_id || envelope.matchId || '');
+  const turnNum = Number(turn.turn ?? turn.turnNumber ?? envelope.turn ?? 0);
+  const turnNumber = Number.isFinite(turnNum) ? turnNum : 0;
+  const balances = turn.balances || envelope.balances || {};
+  const selfBalance = toBalance(balances.self ?? balances.selfBalance, 100);
+  const opponentBalance = toBalance(balances.opponent ?? balances.opponentBalance, 100);
+  const commitmentObj = turn.strategyCommitment || envelope.strategyCommitment || {};
+  const commitment = commitmentObj.hash || commitmentObj.commitment || '0x0';
+  const circuitVersion = commitmentObj.circuitVersion || 'v1';
+  const deadline = turn.deadline || envelope.deadline || null;
+
+  const key = `${matchId}:${turnNumber}`;
+  if (seenStealResponses.has(key)) {
+    console.log(`[steal ${key}] duplikat — kirim jawaban tersimpan`);
+    return sendJson(res, 200, seenStealResponses.get(key));
+  }
+
+  const idempotencyKey =
+    `match-${matchId.slice(0, 8)}-turn-${turnNumber}-` +
+    keccak256(matchId + ':' + turnNumber).slice(0, 8);
+
+  // Deadline hampir habis -> HOLD cepat tanpa proof.
+  const late = deadline ? Date.parse(deadline) - Date.now() < 2000 : false;
+  const action = late
+    ? { type: 'HOLD' }
+    : decideStealAction(selfBalance, opponentBalance);
+  const amount = action.amount || 0;
+  const fields = {
+    commitment,
+    matchId,
+    turn: turnNumber,
+    selfBalance: selfBalance.toString(10),
+    opponentBalance: opponentBalance.toString(10),
+    actionType: action.type,
+    amount,
+    circuitVersion,
+  };
+  const publicInputsHash = computePublicInputsHash(fields);
+
+  let proofData = null;
+  if (!late) {
+    try {
+      proofData = await generateVfyProof(fields);
+    } catch (err) {
+      console.error(`[steal ${key}] generateVfyProof gagal:`, err.message);
+      proofData = null;
+    }
+  }
+
+  let proofReference = null;
+  if (proofData) {
+    try {
+      proofReference = await submitToKurier(
+        proofData.proof, proofData.publicSignals, VFY_VK_HASH
+      );
+    } catch (err) {
+      console.error(`[steal ${key}] kurier gagal:`, err.message);
+    }
+  }
+
+  const policyProof = {
+    circuitVersion,
+    publicInputsHash,
+    ...(proofReference ? { proofReference } : {}),
+    ...(proofData
+      ? { proof: proofData.proof, publicSignals: proofData.publicSignals }
+      : {}),
+  };
+  const response = {
+    matchId,
+    turn: turnNumber,
+    action,
+    policyProof,
+    agentTimestamp: new Date().toISOString(),
+    idempotencyKey,
+    ...(proofData
+      ? {
+          proof: proofData.proof,
+          publicSignals: proofData.publicSignals,
+          public_signals: proofData.publicSignals,
+        }
+      : {}),
+  };
+  seenStealResponses.set(key, response);
+  console.log(
+    `[steal ${key}] ${action.type} proof=${proofData ? 'ok' : 'none'} ` +
+      `${Date.now() - startedAt}ms`
+  );
+  return sendJson(res, 200, response);
+}
+
 async function handleTask(req, res, rawBody) {
   const startedAt = Date.now();
   if (!signaturesMatch(HMAC_SECRET, rawBody, req.headers['x-agent-games-signature'])) {
@@ -325,6 +604,20 @@ async function handleTask(req, res, rawBody) {
     console.log(`[preflight] agent ${envelope.agent_id || ''} nonce ${envelope.nonce || ''}`);
     return sendJson(res, 200, { ok: true, protocolVersion: 'v1' });
   }
+
+  // STEAL THE VFY — envelope turn, bukan task Gatekeeper. Dikenali
+  // dari eventId "steal-the-vfy" atau dari adanya matchId + turn +
+  // balances. Routing ini harus terjadi SEBELUM logika Gatekeeper,
+  // kalau tidak turn Steal akan dijawab dengan format Gatekeeper
+  // (decision REJECT) dan ditolak sebagai schema error.
+  const _stealTask = envelope.input || envelope.task || envelope;
+  const _stealEventId = envelope.eventId || _stealTask.eventId || '';
+  const _isSteal =
+    _stealEventId === 'steal-the-vfy' ||
+    (_stealTask.matchId &&
+      (_stealTask.turn !== undefined || _stealTask.turnNumber !== undefined) &&
+      _stealTask.balances);
+  if (_isSteal) return handleSteal(req, res, envelope);
 
   const task = envelope.input || envelope.task || envelope;
   const taskId = envelope.task_id || envelope.taskId || task.task_id || 'unknown';
@@ -392,10 +685,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
       return sendJson(res, 200, {
         status: 'ok',
-        service: 'agent-games-gatekeeper-single-file',
-        tracks: ['proof-gatekeeper'],
+        service: 'agent-games-gatekeeper-steal-single-file',
+        tracks: ['proof-gatekeeper', 'steal-the-vfy'],
         hmac_configured: Boolean(HMAC_SECRET),
         kurier_enabled: process.env.ZKVERIFY_MODE === 'kurier',
+        steal_strategy: 'fortify-when-behind-else-extract-5',
         uptime_s: Math.round(process.uptime()),
       });
     }
@@ -411,10 +705,10 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Gatekeeper (single file) listening on port ${PORT}`);
+  console.log(`Gatekeeper + Steal (single file) listening on port ${PORT}`);
   console.log(`HMAC configured: ${Boolean(HMAC_SECRET)} | Kurier: ${process.env.ZKVERIFY_MODE || 'local'}`);
   console.log('GET  /health  -> health check');
-  console.log('POST /agent    -> endpoint utama (daftarkan URL lengkap ini di dashboard)');
+  console.log('POST /agent    -> endpoint utama (Gatekeeper + Steal the VFY)');
   console.log('POST /         -> juga diterima (alias, untuk test lokal)');
   // Unduh circuit di background supaya task pertama tidak menunggu lama.
   ensureCircuits().catch((e) => console.error('[circuit] download gagal:', e.message));
